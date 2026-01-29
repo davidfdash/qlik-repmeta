@@ -207,21 +207,6 @@ def _rgb01_from_hex(hexstr: str):
     hexstr = hexstr.strip().lstrip("#")
     return (int(hexstr[0:2],16)/255.0, int(hexstr[2:4],16)/255.0, int(hexstr[4:6],16)/255.0)
 
-def _clean_stream_label(label: str) -> str:
-    if not label:
-        return label
-    try:
-        if isinstance(label, str) and label.strip().startswith("{"):
-            obj = json.loads(label)
-            if isinstance(obj, dict) and "name" in obj:
-                return str(obj["name"])
-        m = re.search(r'"name"\s*:\s*"([^"]+)"', str(label))
-        if m:
-            return m.group(1)
-    except Exception:
-        pass
-    return str(label)
-
 def _insert_chart(doc: Document, title: str, series: List[Tuple[str, float]], width_in=6.0):
     _h2(doc, title)
     try:
@@ -280,33 +265,6 @@ def _try_fetch_one(cur, candidates: List[Tuple[str, Tuple]]):
             _rollback_silent(cur)
             continue
     return {}
-
-# ---------- Higher-level query helpers ----------
-def _apps_by_stream(cur, snapshot_id: int) -> List[Dict]:
-    # 1) v_apps (preferred)
-    rows = _fetch_all(cur, """
-        SELECT COALESCE(stream,'(Unassigned)') AS k, COUNT(*) AS v
-        FROM repmeta_qs.v_apps
-        WHERE snapshot_id=%s
-        GROUP BY 1
-        ORDER BY v DESC, k
-    """, snapshot_id)
-    if rows:
-        return rows
-    # 2) raw apps + left join streams (fallback)
-    rows = _fetch_all(cur, """
-        SELECT
-          COALESCE(s.data->>'name', a.data->'stream'->>'name', '(Unassigned)') AS k,
-          COUNT(*) AS v
-        FROM repmeta_qs.apps a
-        LEFT JOIN repmeta_qs.streams s
-          ON NULLIF(a.data->'stream'->>'id','')::uuid = s.stream_id
-         AND s.snapshot_id = a.snapshot_id
-        WHERE a.snapshot_id = %s
-        GROUP BY 1
-        ORDER BY v DESC, k
-    """, snapshot_id)
-    return rows
 
 def _get_snapshot_customer_id(cur, snapshot_id: int) -> Optional[int]:
     for q in (
@@ -598,7 +556,7 @@ def _env_fallbacks(cur, snapshot_id: int, env: Dict) -> Dict:
     out.setdefault("product_name", out.get("product_name") or "Qlik Sense")
     for label, sql in [
         ("extension_count", "SELECT COUNT(*) AS c FROM repmeta_qs.extensions WHERE snapshot_id=%s"),
-        ("stream_count",    "SELECT COUNT(*) AS c FROM repmeta_qs.streams WHERE snapshot_id=%s"),
+        ("stream_count",    "SELECT COUNT(DISTINCT NULLIF(data->'stream'->>'id','')) AS c FROM repmeta_qs.apps WHERE snapshot_id=%s"),
         ("reload_task_count","SELECT COUNT(*) AS c FROM repmeta_qs.reload_tasks WHERE snapshot_id=%s"),
         ("user_count",      "SELECT COUNT(*) AS c FROM repmeta_qs.users WHERE snapshot_id=%s"),
         ("node_count",      "SELECT COUNT(*) AS c FROM repmeta_qs.servernode_config WHERE snapshot_id=%s"),
@@ -662,6 +620,113 @@ def _reload_activity(cur, snapshot_id: int) -> Dict[str, int]:
         _rollback_silent(cur)
         return {"apps_reloaded_30d": 0, "apps_reloaded_90d": 0}
 
+def _server_infrastructure(cur, snapshot_id: int) -> List[Dict]:
+    """Fetch server node config joined with hardware info."""
+    # Try to join servernode_config with server_hardware
+    try:
+        rows = cur.execute(
+            """
+            SELECT
+                sc.data->>'name' AS server_name,
+                sc.data->>'hostName' AS hostname,
+                COALESCE((sc.data->>'isCentral')::boolean, false) AS is_central,
+                COALESCE((sc.data->>'engineEnabled')::boolean, false) AS engine_enabled,
+                COALESCE((sc.data->>'proxyEnabled')::boolean, false) AS proxy_enabled,
+                COALESCE((sc.data->>'schedulerEnabled')::boolean, false) AS scheduler_enabled,
+                COALESCE((sc.data->>'printingEnabled')::boolean, false) AS printing_enabled,
+                (sh.data->>'cpu_cores')::int AS cpu_cores,
+                (sh.data->>'total_memory_gb')::numeric AS total_memory_gb,
+                sh.data->>'model' AS hw_model,
+                sh.data->>'os' AS os_name
+            FROM repmeta_qs.servernode_config sc
+            LEFT JOIN repmeta_qs.server_hardware sh
+                ON lower(sc.data->>'hostName') = lower(sh.hostname)
+               AND sh.snapshot_id = sc.snapshot_id
+            WHERE sc.snapshot_id = %s
+            ORDER BY (sc.data->>'isCentral')::boolean DESC NULLS LAST, sc.data->>'name'
+            """,
+            (snapshot_id,)
+        ).fetchall()
+        return [dict(r) for r in rows] if rows else []
+    except Exception:
+        _rollback_silent(cur)
+    # Fallback: just servernode_config without hardware
+    try:
+        rows = cur.execute(
+            """
+            SELECT
+                data->>'name' AS server_name,
+                data->>'hostName' AS hostname,
+                COALESCE((data->>'isCentral')::boolean, false) AS is_central,
+                COALESCE((data->>'engineEnabled')::boolean, false) AS engine_enabled,
+                COALESCE((data->>'proxyEnabled')::boolean, false) AS proxy_enabled,
+                COALESCE((data->>'schedulerEnabled')::boolean, false) AS scheduler_enabled,
+                COALESCE((data->>'printingEnabled')::boolean, false) AS printing_enabled,
+                NULL::int AS cpu_cores,
+                NULL::numeric AS total_memory_gb,
+                NULL AS hw_model,
+                NULL AS os_name
+            FROM repmeta_qs.servernode_config
+            WHERE snapshot_id = %s
+            ORDER BY (data->>'isCentral')::boolean DESC NULLS LAST, data->>'name'
+            """,
+            (snapshot_id,)
+        ).fetchall()
+        return [dict(r) for r in rows] if rows else []
+    except Exception:
+        _rollback_silent(cur)
+        return []
+
+def _server_table(doc: Document, servers: List[Dict]):
+    """Add a server infrastructure table to the document."""
+    if not servers:
+        _para(doc, "No server information available.", size=10, color=QLIK_RGB["gray6"])
+        return
+
+    headers = ["Server", "Role", "CPU", "RAM (GB)", "Services"]
+    t = doc.add_table(rows=1, cols=len(headers))
+    t.alignment = WD_TABLE_ALIGNMENT.LEFT
+
+    # Header row
+    hdr = t.rows[0].cells
+    for i, h in enumerate(headers):
+        hdr[i].text = h
+        _set_cell_bg(hdr[i], QLIK_HEX["gray3"])
+        for p in hdr[i].paragraphs:
+            for run in p.runs:
+                run.bold = True
+                run.font.size = Pt(9)
+                run.font.name = FONT_FAMILY
+
+    # Data rows
+    for srv in servers:
+        row = t.add_row().cells
+        row[0].text = srv.get("server_name") or srv.get("hostname") or "—"
+        row[1].text = "Central" if srv.get("is_central") else "Rim"
+
+        cpu = srv.get("cpu_cores")
+        row[2].text = str(cpu) if cpu else "—"
+
+        mem = srv.get("total_memory_gb")
+        row[3].text = f"{mem:.0f}" if mem else "—"
+
+        services = []
+        if srv.get("engine_enabled"):
+            services.append("Engine")
+        if srv.get("proxy_enabled"):
+            services.append("Proxy")
+        if srv.get("scheduler_enabled"):
+            services.append("Scheduler")
+        if srv.get("printing_enabled"):
+            services.append("Printing")
+        row[4].text = ", ".join(services) if services else "—"
+
+        for cell in row:
+            for p in cell.paragraphs:
+                for run in p.runs:
+                    run.font.size = Pt(9)
+                    run.font.name = FONT_FAMILY
+
 # =========================
 # Main API
 # =========================
@@ -711,7 +776,8 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
         # Prefer robust reload activity
         rts = _reload_activity(cur, snapshot_id)
 
-        apps_by_stream = _apps_by_stream(cur, snapshot_id)
+        # Server infrastructure
+        servers = _server_infrastructure(cur, snapshot_id)
 
     # Executive blocks
     _h1(doc, "Executive Summary")
@@ -790,14 +856,9 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
         ("Security Rules — Default (Disabled)", fmt(rule_breakdown.get("default_disabled"))),
     ])
 
-    # Visuals
-    top_streams = [(_clean_stream_label(r["k"]), r["v"]) for r in apps_by_stream[:8]]
-    _insert_chart(doc, "Top Streams by App Count", top_streams, width_in=6.0)
-
-    _h1(doc, "Detailed Insights")
+    _h1(doc, "Server Infrastructure")
     _hr(doc)
-    _h2(doc, "Apps by Stream")
-    _table_2col(doc, "Stream", "Apps", [(_clean_stream_label(r["k"]), r["v"]) for r in apps_by_stream])
+    _server_table(doc, servers)
 
     _h1(doc, "Environment")
     _hr(doc)
