@@ -61,11 +61,18 @@ FILES_MAP = [
     ("users", "QlikUser.json", None),
     ("extensions", "QlikExtension.json", None),
     ("access_professional", "QlikProfessionalAccessType.json", None),
+    ("access_analyzer", "QlikAnalyzerAccessType.json", None),
     ("access_analyzer_time", "QlikAnalyzerTimeAccessType.json", None),
     ("reload_tasks", "QlikReloadTask.json", "appId"),
     ("servernode_config", "QlikServernodeConfiguration.json", None),
     ("system_rules", "QlikSystemRule.json", None),
+    ("streams", "QlikStream.json", None),
 ]
+
+# Fallback files when primary doesn't exist
+FALLBACK_FILES = {
+    "QlikUser.json": "QlikUserAccessType.json",
+}
 
 def _extract_hardware_info(hw_data: Dict[str, Any]) -> Dict[str, Any]:
     """Extract relevant hardware info (CPU, memory) from OSInfo JSON."""
@@ -114,10 +121,18 @@ def _classify_hardware_files(files: Dict[str, bytes]) -> List[Dict[str, Any]]:
 def _classify_files(files: Dict[str, bytes]) -> Dict[str, Optional[bytes]]:
     out: Dict[str, Optional[bytes]] = {fname: None for (_, fname, _) in FILES_MAP}
     for canon in out.keys():
+        # Try primary file first
         for k, v in files.items():
             if k.lower().endswith(canon.lower()):
                 out[canon] = v
                 break
+        # Try fallback if primary not found
+        if out[canon] is None and canon in FALLBACK_FILES:
+            fallback = FALLBACK_FILES[canon]
+            for k, v in files.items():
+                if k.lower().endswith(fallback.lower()):
+                    out[canon] = v
+                    break
     return out
 
 def _build_server_name_map(nodes: List[Dict[str, Any]], hardware: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -230,8 +245,8 @@ async def ingest_from_buffers(buffers: Dict[str, bytes], customer_id: int, notes
                     data = _read_json_bytes(b)
 
                 key_name = "id"
-                if table in ("apps", "users", "extensions", "reload_tasks", "servernode_config", "system_rules", "app_objects"):
-                    key_name = {"apps":"app_id","users":"user_id","extensions":"extension_id","reload_tasks":"task_id","servernode_config":"node_id","system_rules":"rule_id","app_objects":"object_id"}[table]
+                if table in ("apps", "users", "extensions", "reload_tasks", "servernode_config", "system_rules", "app_objects", "streams", "access_professional", "access_analyzer", "access_analyzer_time"):
+                    key_name = {"apps":"app_id","users":"user_id","extensions":"extension_id","reload_tasks":"task_id","servernode_config":"node_id","system_rules":"rule_id","app_objects":"object_id","streams":"stream_id","access_professional":"access_id","access_analyzer":"access_id","access_analyzer_time":"access_id"}[table]
                 if isinstance(data, list):
                     await _insert_collection(cur, table, key_name, data, snapshot_id, app_id_key=app_id_key)
                 elif isinstance(data, dict):

@@ -556,9 +556,8 @@ def _env_fallbacks(cur, snapshot_id: int, env: Dict) -> Dict:
     out.setdefault("product_name", out.get("product_name") or "Qlik Sense")
     for label, sql in [
         ("extension_count", "SELECT COUNT(*) AS c FROM repmeta_qs.extensions WHERE snapshot_id=%s"),
-        ("stream_count",    "SELECT COUNT(DISTINCT NULLIF(data->'stream'->>'id','')) AS c FROM repmeta_qs.apps WHERE snapshot_id=%s"),
+        ("streams_with_apps", "SELECT COUNT(DISTINCT NULLIF(data->'stream'->>'id','')) AS c FROM repmeta_qs.apps WHERE snapshot_id=%s"),
         ("reload_task_count","SELECT COUNT(*) AS c FROM repmeta_qs.reload_tasks WHERE snapshot_id=%s"),
-        ("user_count",      "SELECT COUNT(*) AS c FROM repmeta_qs.users WHERE snapshot_id=%s"),
         ("node_count",      "SELECT COUNT(*) AS c FROM repmeta_qs.servernode_config WHERE snapshot_id=%s"),
     ]:
         try:
@@ -568,6 +567,36 @@ def _env_fallbacks(cur, snapshot_id: int, env: Dict) -> Dict:
         except Exception:
             _rollback_silent(cur)
             out.setdefault(label, 0)
+
+    # Total streams from streams table (if available), fallback to streams_with_apps
+    try:
+        r = cur.execute("SELECT COUNT(*) AS c FROM repmeta_qs.streams WHERE snapshot_id=%s", (snapshot_id,)).fetchone()
+        stream_count = r and r.get("c") or 0
+        out["stream_count"] = stream_count if stream_count > 0 else out.get("streams_with_apps", 0)
+    except Exception:
+        _rollback_silent(cur)
+        out["stream_count"] = out.get("streams_with_apps", 0)
+
+    # User count - try counting unique users from users table
+    # Data may be from QlikUser.json (direct users) or QlikUserAccessType.json (user subobject)
+    try:
+        # First try direct count
+        r = cur.execute("SELECT COUNT(*) AS c FROM repmeta_qs.users WHERE snapshot_id=%s", (snapshot_id,)).fetchone()
+        user_count = r and r.get("c") or 0
+        # If we have data but it's QlikUserAccessType format, count unique user IDs
+        if user_count > 0:
+            r2 = cur.execute(
+                "SELECT COUNT(DISTINCT data->'user'->>'id') AS c FROM repmeta_qs.users WHERE snapshot_id=%s AND data->'user' IS NOT NULL",
+                (snapshot_id,)
+            ).fetchone()
+            unique_users = r2 and r2.get("c") or 0
+            out["user_count"] = unique_users if unique_users > 0 else user_count
+        else:
+            out["user_count"] = 0
+    except Exception:
+        _rollback_silent(cur)
+        out.setdefault("user_count", 0)
+
     return out
 
 def _reload_activity(cur, snapshot_id: int) -> Dict[str, int]:
@@ -764,6 +793,96 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
         rules = _fetch_one(cur, "SELECT * FROM repmeta_qs.v_security_rule_summary WHERE snapshot_id=%s", snapshot_id) or {}
         gov   = _fetch_one(cur, "SELECT * FROM repmeta_qs.v_governance_checks WHERE snapshot_id=%s", snapshot_id) or {}
 
+        # Fallback: compute total_apps/published_apps from raw apps table if view didn't return data
+        if not apps.get("total_apps"):
+            try:
+                row = cur.execute(
+                    "SELECT COUNT(*) AS total_apps, "
+                    "COUNT(*) FILTER (WHERE (data->>'published')::boolean) AS published_apps "
+                    "FROM repmeta_qs.apps WHERE snapshot_id=%s",
+                    (snapshot_id,)
+                ).fetchone()
+                if row:
+                    apps["total_apps"] = row.get("total_apps", 0)
+                    apps["published_apps"] = row.get("published_apps", 0)
+            except Exception:
+                _rollback_silent(cur)
+
+        # Fallback: compute governance checks from raw tables if view didn't return data
+        if not gov.get("apps_without_tasks") and gov.get("apps_without_tasks") != 0:
+            try:
+                row = cur.execute(
+                    """
+                    SELECT
+                      COUNT(*) FILTER (WHERE rt.task_id IS NULL) AS apps_without_tasks
+                    FROM repmeta_qs.apps a
+                    LEFT JOIN repmeta_qs.reload_tasks rt
+                      ON a.app_id = COALESCE(rt.app_id, rt.data->'app'->>'id')
+                      AND rt.snapshot_id = a.snapshot_id
+                    WHERE a.snapshot_id = %s
+                    """,
+                    (snapshot_id,)
+                ).fetchone()
+                if row:
+                    gov["apps_without_tasks"] = row.get("apps_without_tasks", 0)
+            except Exception:
+                _rollback_silent(cur)
+        if not gov.get("disabled_tasks_count") and gov.get("disabled_tasks_count") != 0:
+            try:
+                row = cur.execute(
+                    "SELECT COUNT(*) AS c FROM repmeta_qs.reload_tasks "
+                    "WHERE snapshot_id=%s AND (data->>'enabled')::boolean IS NOT TRUE",
+                    (snapshot_id,)
+                ).fetchone()
+                if row:
+                    gov["disabled_tasks_count"] = row.get("c", 0)
+            except Exception:
+                _rollback_silent(cur)
+
+        # Fallback: compute license usage from raw access tables if view didn't return data
+        if not lic30.get("professional_used_30d") and lic30.get("professional_used_30d") != 0:
+            try:
+                row = cur.execute(
+                    """
+                    SELECT
+                      COUNT(*) FILTER (WHERE NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NOT NULL
+                        AND (data->>'lastUsed')::timestamptz >= now() - interval '30 days') AS professional_used_30d,
+                      COUNT(*) FILTER (WHERE NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NOT NULL
+                        AND (data->>'lastUsed')::timestamptz < now() - interval '30 days') AS professional_not_used_30d,
+                      COUNT(*) FILTER (WHERE NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NULL) AS professional_never_used
+                    FROM repmeta_qs.access_professional
+                    WHERE snapshot_id=%s
+                    """,
+                    (snapshot_id,)
+                ).fetchone()
+                if row:
+                    lic30["professional_used_30d"] = row.get("professional_used_30d", 0)
+                    lic30["professional_not_used_30d"] = row.get("professional_not_used_30d", 0)
+                    lic30["professional_never_used"] = row.get("professional_never_used", 0)
+            except Exception:
+                _rollback_silent(cur)
+        if not lic30.get("analyzer_used_30d") and lic30.get("analyzer_used_30d") != 0:
+            try:
+                row = cur.execute(
+                    """
+                    SELECT
+                      COUNT(*) FILTER (WHERE NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NOT NULL
+                        AND (data->>'lastUsed')::timestamptz >= now() - interval '30 days') AS analyzer_used_30d,
+                      COUNT(*) FILTER (WHERE NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NOT NULL
+                        AND (data->>'lastUsed')::timestamptz < now() - interval '30 days') AS analyzer_not_used_30d,
+                      COUNT(*) FILTER (WHERE NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NULL) AS analyzer_never_used
+                    FROM repmeta_qs.access_analyzer
+                    WHERE snapshot_id=%s
+                    """,
+                    (snapshot_id,)
+                ).fetchone()
+                if row:
+                    lic30["analyzer_used_30d"] = row.get("analyzer_used_30d", 0)
+                    lic30["analyzer_not_used_30d"] = row.get("analyzer_not_used_30d", 0)
+                    lic30["analyzer_never_used"] = row.get("analyzer_never_used", 0)
+            except Exception:
+                _rollback_silent(cur)
+
         # Hardened license meta + allocations
         lic_raw = _fetch_license_key_details(cur, snapshot_id, license_json)
         keyd = _parse_license_key_details(lic_raw.get("key_details"))
@@ -787,8 +906,8 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
     _kpi_cards(doc, [
         ("Total Apps", apps.get("total_apps", 0), "info"),
         ("Published Apps", apps.get("published_apps", 0), "ok"),
-        ("Streams", apps.get("streams", 0), "info"),
-        ("Streams w/ Apps", apps.get("streams_with_apps", 0), "info"),
+        ("Streams", env.get("stream_count", 0), "info"),
+        ("Streams w/ Apps", env.get("streams_with_apps", 0), "info"),
     ])
     _kpi_cards(doc, [
         ("Users", env.get("user_count", 0), "info"),
