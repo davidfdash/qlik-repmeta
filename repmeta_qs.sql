@@ -397,6 +397,23 @@ CREATE INDEX users_data_gin ON repmeta_qs.users USING gin (data);
 CREATE INDEX users_user_id_idx ON repmeta_qs.users USING btree (user_id);
 
 
+-- repmeta_qs.tasks definition
+
+-- Drop table
+
+-- DROP TABLE repmeta_qs.tasks;
+
+CREATE TABLE repmeta_qs.tasks (
+	snapshot_id int4 NOT NULL,
+	task_id text NOT NULL,
+	"data" jsonb NOT NULL,
+	CONSTRAINT tasks_pkey PRIMARY KEY (snapshot_id, task_id),
+	CONSTRAINT tasks_snapshot_id_fkey FOREIGN KEY (snapshot_id) REFERENCES repmeta_qs."snapshot"(snapshot_id) ON DELETE CASCADE
+);
+CREATE INDEX tasks_snapshot_id_idx ON repmeta_qs.tasks USING btree (snapshot_id);
+CREATE INDEX tasks_task_id_idx ON repmeta_qs.tasks USING btree (task_id);
+
+
 -- repmeta_qs.servernode_configuration source
 
 CREATE OR REPLACE VIEW repmeta_qs.servernode_configuration
@@ -657,6 +674,7 @@ AS SELECT s.snapshot_id,
 
 
 -- repmeta_qs.v_license_usage_30d source
+-- Anchored to MAX(last_used) per snapshot instead of now()
 
 CREATE OR REPLACE VIEW repmeta_qs.v_license_usage_30d
 AS WITH allocs AS (
@@ -669,17 +687,23 @@ AS WITH allocs AS (
          SELECT access_analyzer_time.snapshot_id,
             'analyzer'::text AS kind,
             access_analyzer_time.data ->> 'id'::text,
-            COALESCE(NULLIF(access_analyzer_time.data ->> 'lastUsed'::text, ''::text), NULLIF(access_analyzer_time.data ->> 'lastAccess'::text, ''::text), NULLIF(access_analyzer_time.data ->> 'lastSeen'::text, ''::text))::timestamp with time zone AS "coalesce"
+            COALESCE(NULLIF(access_analyzer_time.data ->> 'lastUsed'::text, ''::text), NULLIF(access_analyzer_time.data ->> 'lastAccess'::text, ''::text), NULLIF(access_analyzer_time.data ->> 'lastSeen'::text, ''::text))::timestamp with time zone AS last_used
            FROM repmeta_qs.access_analyzer_time
+        ), snapshot_max AS (
+         SELECT allocs.snapshot_id, MAX(allocs.last_used) AS max_used
+           FROM allocs
+          WHERE allocs.last_used IS NOT NULL
+          GROUP BY allocs.snapshot_id
         ), bucketed AS (
          SELECT allocs.snapshot_id,
             allocs.kind,
                 CASE
                     WHEN allocs.last_used IS NULL THEN 'never'::text
-                    WHEN allocs.last_used >= (now() - '30 days'::interval) THEN 'used_30d'::text
+                    WHEN allocs.last_used >= (sm.max_used - '30 days'::interval) THEN 'used_30d'::text
                     ELSE 'not_used_30d'::text
                 END AS bucket
            FROM allocs
+           LEFT JOIN snapshot_max sm ON sm.snapshot_id = allocs.snapshot_id
         )
  SELECT s.snapshot_id,
     COALESCE(sum((b.bucket = 'used_30d'::text)::integer) FILTER (WHERE b.kind = 'analyzer'::text), 0::bigint) AS analyzer_used_30d,
@@ -703,6 +727,7 @@ AS SELECT n.snapshot_id,
 
 
 -- repmeta_qs.v_reload_activity_json source
+-- Anchored to MAX(stop_ts) per snapshot instead of now()
 
 CREATE OR REPLACE VIEW repmeta_qs.v_reload_activity_json
 AS WITH raw AS (
@@ -717,12 +742,17 @@ AS WITH raw AS (
            FROM raw
           WHERE raw.stop_ts IS NOT NULL
           GROUP BY raw.snapshot_id, raw.app_id
+        ), snapshot_max AS (
+         SELECT last_by_app.snapshot_id, MAX(last_by_app.ts) AS max_stop
+           FROM last_by_app
+          GROUP BY last_by_app.snapshot_id
         )
- SELECT last_by_app.snapshot_id,
-    count(*) FILTER (WHERE last_by_app.ts >= (now() - '30 days'::interval)) AS apps_reloaded_30d,
-    count(*) FILTER (WHERE last_by_app.ts >= (now() - '90 days'::interval)) AS apps_reloaded_90d
-   FROM last_by_app
-  GROUP BY last_by_app.snapshot_id;
+ SELECT lba.snapshot_id,
+    count(*) FILTER (WHERE lba.ts >= (sm.max_stop - '30 days'::interval)) AS apps_reloaded_30d,
+    count(*) FILTER (WHERE lba.ts >= (sm.max_stop - '90 days'::interval)) AS apps_reloaded_90d
+   FROM last_by_app lba
+   LEFT JOIN snapshot_max sm ON sm.snapshot_id = lba.snapshot_id
+  GROUP BY lba.snapshot_id;
 
 
 -- repmeta_qs.v_reload_task_summary source
@@ -838,6 +868,51 @@ AS SELECT u.snapshot_id,
     COALESCE(u.data ->> 'userDirectory'::text, u.data ->> 'directory'::text, u.data ->> 'user_directory'::text) AS user_directory
    FROM repmeta_qs.users u;
 
+
+
+-- repmeta_qs.v_task_execution_summary source
+
+CREATE OR REPLACE VIEW repmeta_qs.v_task_execution_summary AS
+WITH parsed AS (
+    SELECT
+        t.snapshot_id,
+        t.task_id,
+        COALESCE(t.data->>'name', t.data->>'taskName', '?') AS task_name,
+        (t.data->'operational'->'lastExecutionResult'->>'status')::int AS status,
+        NULLIF(t.data->'operational'->'lastExecutionResult'->>'stopTime','')::timestamptz AS stop_time
+    FROM repmeta_qs.tasks t
+),
+snapshot_max AS (
+    SELECT snapshot_id, MAX(stop_time) AS max_stop
+    FROM parsed
+    WHERE stop_time IS NOT NULL
+    GROUP BY snapshot_id
+)
+SELECT
+    p.snapshot_id,
+    COUNT(*) AS total_tasks,
+    COUNT(*) FILTER (WHERE p.status IS NOT NULL) AS tasks_with_results,
+    COUNT(*) FILTER (WHERE p.stop_time >= sm.max_stop - interval '30 days') AS tasks_run_30d,
+    COUNT(*) FILTER (WHERE p.stop_time >= sm.max_stop - interval '30 days' AND p.status = 7) AS successful_30d,
+    COUNT(*) FILTER (WHERE p.stop_time >= sm.max_stop - interval '30 days' AND p.status != 7) AS failed_30d,
+    CASE
+        WHEN COUNT(*) FILTER (WHERE p.stop_time >= sm.max_stop - interval '30 days') > 0
+        THEN ROUND(100.0 * COUNT(*) FILTER (WHERE p.stop_time >= sm.max_stop - interval '30 days' AND p.status = 7)
+             / COUNT(*) FILTER (WHERE p.stop_time >= sm.max_stop - interval '30 days'), 1)
+        ELSE 0
+    END AS success_pct_30d,
+    COUNT(*) FILTER (WHERE p.status = 7) AS successful_overall,
+    COUNT(*) FILTER (WHERE p.status IS NOT NULL AND p.status != 7) AS not_successful_overall,
+    CASE
+        WHEN COUNT(*) FILTER (WHERE p.status IS NOT NULL) > 0
+        THEN ROUND(100.0 * COUNT(*) FILTER (WHERE p.status = 7)
+             / COUNT(*) FILTER (WHERE p.status IS NOT NULL), 1)
+        ELSE 0
+    END AS success_pct_overall,
+    COUNT(DISTINCT p.task_name) FILTER (WHERE p.status IS NULL OR p.status != 7) AS never_succeeded_count
+FROM parsed p
+LEFT JOIN snapshot_max sm ON sm.snapshot_id = p.snapshot_id
+GROUP BY p.snapshot_id;
 
 
 -- DROP FUNCTION repmeta_qs.rx_int(text, text);

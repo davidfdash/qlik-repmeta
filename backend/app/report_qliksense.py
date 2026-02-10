@@ -633,11 +633,14 @@ def _reload_activity(cur, snapshot_id: int) -> Dict[str, int]:
               FROM raw
               WHERE stop_ts IS NOT NULL
               GROUP BY app_id
+            ),
+            snapshot_max AS (
+              SELECT MAX(ts) AS max_stop FROM last_by_app
             )
             SELECT
-              COUNT(*) FILTER (WHERE ts >= now() - interval '30 days') AS apps_reloaded_30d,
-              COUNT(*) FILTER (WHERE ts >= now() - interval '90 days') AS apps_reloaded_90d
-            FROM last_by_app
+              COUNT(*) FILTER (WHERE ts >= sm.max_stop - interval '30 days') AS apps_reloaded_30d,
+              COUNT(*) FILTER (WHERE ts >= sm.max_stop - interval '90 days') AS apps_reloaded_90d
+            FROM last_by_app, snapshot_max sm
             """,
             (snapshot_id,)
         ).fetchone() or {}
@@ -756,6 +759,110 @@ def _server_table(doc: Document, servers: List[Dict]):
                     run.font.size = Pt(9)
                     run.font.name = FONT_FAMILY
 
+STATUS_LABELS = {
+    0: "NeverStarted", 1: "Triggered", 2: "Started", 3: "Queued",
+    4: "AbortInitiated", 5: "Aborting", 6: "Aborted", 7: "FinishedSuccess",
+    8: "FinishedFail", 9: "Skipped", 10: "Retry", 11: "Error", 12: "Reset",
+}
+
+def _task_execution_health(cur, snapshot_id: int) -> Dict:
+    """Fetch task execution summary: 30d activity, success rates, never-succeeded count."""
+    defaults = {
+        "total_tasks": 0, "tasks_with_results": 0,
+        "tasks_run_30d": 0, "successful_30d": 0, "failed_30d": 0, "success_pct_30d": 0,
+        "successful_overall": 0, "not_successful_overall": 0, "success_pct_overall": 0,
+        "never_succeeded_count": 0,
+    }
+    # Try the view first
+    try:
+        row = cur.execute(
+            "SELECT * FROM repmeta_qs.v_task_execution_summary WHERE snapshot_id=%s",
+            (snapshot_id,)
+        ).fetchone()
+        if row and row.get("total_tasks"):
+            return dict(row)
+    except Exception:
+        _rollback_silent(cur)
+
+    # Fallback: compute from raw tasks JSON
+    try:
+        rows = cur.execute(
+            """
+            SELECT
+                COALESCE(data->>'name', data->>'taskName', '?') AS task_name,
+                (data->'operational'->'lastExecutionResult'->>'status')::int AS status,
+                NULLIF(data->'operational'->'lastExecutionResult'->>'stopTime','')::timestamptz AS stop_time
+            FROM repmeta_qs.tasks
+            WHERE snapshot_id=%s
+            """,
+            (snapshot_id,)
+        ).fetchall()
+        if not rows:
+            return defaults
+
+        total = len(rows)
+        with_results = sum(1 for r in rows if r.get("status") is not None)
+        successful = sum(1 for r in rows if r.get("status") == 7)
+        # Count never-succeeded by distinct task name
+        never_succeeded_names = set()
+        for r in rows:
+            if r.get("status") != 7:
+                never_succeeded_names.add(r.get("task_name") or "?")
+        never_succeeded = len(never_succeeded_names)
+
+        # Anchor 30d window to max stop_time
+        stop_times = [r["stop_time"] for r in rows if r.get("stop_time")]
+        if stop_times:
+            from datetime import timedelta
+            max_stop = max(stop_times)
+            cutoff = max_stop - timedelta(days=30)
+            ran_30d = [r for r in rows if r.get("stop_time") and r["stop_time"] >= cutoff]
+            tasks_run_30d = len(ran_30d)
+            successful_30d = sum(1 for r in ran_30d if r.get("status") == 7)
+            failed_30d = tasks_run_30d - successful_30d
+            pct_30d = round(100.0 * successful_30d / tasks_run_30d, 1) if tasks_run_30d else 0
+        else:
+            tasks_run_30d = successful_30d = failed_30d = 0
+            pct_30d = 0
+
+        pct_overall = round(100.0 * successful / with_results, 1) if with_results else 0
+        return {
+            "total_tasks": total, "tasks_with_results": with_results,
+            "tasks_run_30d": tasks_run_30d, "successful_30d": successful_30d,
+            "failed_30d": failed_30d, "success_pct_30d": pct_30d,
+            "successful_overall": successful,
+            "not_successful_overall": with_results - successful,
+            "success_pct_overall": pct_overall,
+            "never_succeeded_count": never_succeeded,
+        }
+    except Exception:
+        _rollback_silent(cur)
+        return defaults
+
+def _never_succeeded_tasks(cur, snapshot_id: int, limit: int = 25) -> List[Dict]:
+    """Fetch tasks whose last execution was not FinishedSuccess (status != 7)."""
+    try:
+        rows = cur.execute(
+            """
+            SELECT
+                COALESCE(data->>'name', data->>'taskName', '?') AS task_name,
+                (data->'operational'->'lastExecutionResult'->>'status')::int AS status
+            FROM repmeta_qs.tasks
+            WHERE snapshot_id=%s
+              AND (
+                (data->'operational'->'lastExecutionResult'->>'status')::int IS DISTINCT FROM 7
+                OR data->'operational'->'lastExecutionResult'->>'status' IS NULL
+              )
+            ORDER BY data->>'name'
+            LIMIT %s
+            """,
+            (snapshot_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows] if rows else []
+    except Exception:
+        _rollback_silent(cur)
+        return []
+
 # =========================
 # Main API
 # =========================
@@ -840,20 +947,26 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
                 _rollback_silent(cur)
 
         # Fallback: compute license usage from raw access tables if view didn't return data
+        # Anchored to MAX(lastUsed) per snapshot instead of now()
         if not lic30.get("professional_used_30d") and lic30.get("professional_used_30d") != 0:
             try:
                 row = cur.execute(
                     """
+                    WITH max_ts AS (
+                      SELECT MAX(NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z')::timestamptz) AS anchor
+                      FROM repmeta_qs.access_professional
+                      WHERE snapshot_id=%s AND NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NOT NULL
+                    )
                     SELECT
                       COUNT(*) FILTER (WHERE NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NOT NULL
-                        AND (data->>'lastUsed')::timestamptz >= now() - interval '30 days') AS professional_used_30d,
+                        AND (data->>'lastUsed')::timestamptz >= mt.anchor - interval '30 days') AS professional_used_30d,
                       COUNT(*) FILTER (WHERE NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NOT NULL
-                        AND (data->>'lastUsed')::timestamptz < now() - interval '30 days') AS professional_not_used_30d,
+                        AND (data->>'lastUsed')::timestamptz < mt.anchor - interval '30 days') AS professional_not_used_30d,
                       COUNT(*) FILTER (WHERE NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NULL) AS professional_never_used
-                    FROM repmeta_qs.access_professional
+                    FROM repmeta_qs.access_professional, max_ts mt
                     WHERE snapshot_id=%s
                     """,
-                    (snapshot_id,)
+                    (snapshot_id, snapshot_id)
                 ).fetchone()
                 if row:
                     lic30["professional_used_30d"] = row.get("professional_used_30d", 0)
@@ -865,16 +978,21 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
             try:
                 row = cur.execute(
                     """
+                    WITH max_ts AS (
+                      SELECT MAX(NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z')::timestamptz) AS anchor
+                      FROM repmeta_qs.access_analyzer
+                      WHERE snapshot_id=%s AND NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NOT NULL
+                    )
                     SELECT
                       COUNT(*) FILTER (WHERE NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NOT NULL
-                        AND (data->>'lastUsed')::timestamptz >= now() - interval '30 days') AS analyzer_used_30d,
+                        AND (data->>'lastUsed')::timestamptz >= mt.anchor - interval '30 days') AS analyzer_used_30d,
                       COUNT(*) FILTER (WHERE NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NOT NULL
-                        AND (data->>'lastUsed')::timestamptz < now() - interval '30 days') AS analyzer_not_used_30d,
+                        AND (data->>'lastUsed')::timestamptz < mt.anchor - interval '30 days') AS analyzer_not_used_30d,
                       COUNT(*) FILTER (WHERE NULLIF(data->>'lastUsed','1753-01-01T00:00:00Z') IS NULL) AS analyzer_never_used
-                    FROM repmeta_qs.access_analyzer
+                    FROM repmeta_qs.access_analyzer, max_ts mt
                     WHERE snapshot_id=%s
                     """,
-                    (snapshot_id,)
+                    (snapshot_id, snapshot_id)
                 ).fetchone()
                 if row:
                     lic30["analyzer_used_30d"] = row.get("analyzer_used_30d", 0)
@@ -898,6 +1016,10 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
         # Server infrastructure
         servers = _server_infrastructure(cur, snapshot_id)
 
+        # Task execution health (QlikTask.json)
+        tex = _task_execution_health(cur, snapshot_id)
+        never_succ = _never_succeeded_tasks(cur, snapshot_id)
+
     # Executive blocks
     _h1(doc, "Executive Summary")
     _hr(doc)
@@ -915,14 +1037,32 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
         ("Extensions", env.get("extension_count", 0), "info"),
         ("Reload Tasks", env.get("reload_task_count", 0), "info"),
     ])
-
-    _h2(doc, "Reload Health")
     _kpi_cards(doc, [
         ("Apps reloaded (30d)", rts.get("apps_reloaded_30d", 0), "ok"),
         ("Apps reloaded (90d)", rts.get("apps_reloaded_90d", 0), "ok"),
-        ("Failed tasks (last run)", 0, "bad"),
-        ("Tasks > 3h (last run)", 0, "warn"),
     ])
+
+    _h2(doc, "Task Execution Health")
+    _kpi_cards(doc, [
+        ("Total Tasks", tex.get("total_tasks", 0), "info"),
+        ("Tasks w/ Results", tex.get("tasks_with_results", 0), "info"),
+        ("Tasks Run (30d)", tex.get("tasks_run_30d", 0), "info"),
+        ("Success Rate (30d)", f'{tex.get("success_pct_30d", 0)}%', "ok" if tex.get("success_pct_30d", 0) >= 80 else "warn"),
+    ])
+    _kpi_cards(doc, [
+        ("Successful (overall)", tex.get("successful_overall", 0), "ok"),
+        ("Not Successful", tex.get("not_successful_overall", 0), "bad" if tex.get("not_successful_overall", 0) > 0 else "info"),
+        ("Success Rate (overall)", f'{tex.get("success_pct_overall", 0)}%', "ok" if tex.get("success_pct_overall", 0) >= 80 else "warn"),
+        ("Never Succeeded", tex.get("never_succeeded_count", 0), "bad" if tex.get("never_succeeded_count", 0) > 0 else "ok"),
+    ])
+    if never_succ:
+        ns_rows = [
+            (t.get("task_name", "?"), STATUS_LABELS.get(t.get("status"), "NoExecution" if t.get("status") is None else f"Unknown({t.get('status')})"))
+            for t in never_succ
+        ]
+        _table_2col(doc, "Task Name", "Last Status", ns_rows)
+        if tex.get("never_succeeded_count", 0) > len(never_succ):
+            _para(doc, f"  … and {tex['never_succeeded_count'] - len(never_succ)} more", size=9, color=QLIK_RGB["gray6"])
 
     # License
     _h2(doc, "License — Meta")

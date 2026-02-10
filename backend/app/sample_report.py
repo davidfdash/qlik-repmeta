@@ -296,6 +296,21 @@ def load_data_folder(folder: Path) -> Dict[str, Any]:
     if stream_path.exists():
         data["streams"] = load_json(stream_path)
 
+    # Tasks (QlikTask.json — all task types)
+    task_path = folder / "QlikTask.json"
+    if task_path.exists():
+        data["tasks"] = load_json(task_path)
+
+    # Analyzer access
+    analyzer_path = folder / "QlikAnalyzerAccessType.json"
+    if analyzer_path.exists():
+        data["analyzer_access"] = load_json(analyzer_path)
+
+    # Analyzer time access
+    analyzer_time_path = folder / "QlikAnalyzerTimeAccessType.json"
+    if analyzer_time_path.exists():
+        data["analyzer_time_access"] = load_json(analyzer_time_path)
+
     # Hardware folder
     hw_folder = folder / "Hardware"
     if hw_folder.exists() and hw_folder.is_dir():
@@ -451,6 +466,151 @@ def parse_license_key_details(key_details: str) -> Dict[str, Any]:
 
     return out
 
+STATUS_LABELS = {
+    0: "NeverStarted", 1: "Triggered", 2: "Started", 3: "Queued",
+    4: "AbortInitiated", 5: "Aborting", 6: "Aborted", 7: "FinishedSuccess",
+    8: "FinishedFail", 9: "Skipped", 10: "Retry", 11: "Error", 12: "Reset",
+}
+
+def _parse_ts(s: Optional[str]):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def compute_task_execution_health(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute task execution summary from QlikTask.json data."""
+    from datetime import timedelta
+    tasks = data.get("tasks", [])
+    if not tasks:
+        return {
+            "total_tasks": 0, "tasks_with_results": 0,
+            "tasks_run_30d": 0, "successful_30d": 0, "failed_30d": 0, "success_pct_30d": 0,
+            "successful_overall": 0, "not_successful_overall": 0, "success_pct_overall": 0,
+            "never_succeeded_count": 0, "never_succeeded_list": [],
+        }
+
+    total = len(tasks)
+    parsed = []
+    for t in tasks:
+        op = t.get("operational") or {}
+        last = op.get("lastExecutionResult") or {}
+        status = last.get("status")
+        stop_time = _parse_ts(last.get("stopTime"))
+        parsed.append({"name": t.get("name", "?"), "status": status, "stop_time": stop_time})
+
+    with_results = sum(1 for p in parsed if p["status"] is not None)
+    successful = sum(1 for p in parsed if p["status"] == 7)
+    # Count never-succeeded by distinct task name
+    never_succeeded_by_name = {}
+    for p in parsed:
+        if p["status"] != 7:
+            name = p.get("name") or "?"
+            if name not in never_succeeded_by_name:
+                never_succeeded_by_name[name] = p
+    never_succeeded = list(never_succeeded_by_name.values())
+
+    # Anchor 30d window to max stop_time
+    stop_times = [p["stop_time"] for p in parsed if p["stop_time"]]
+    if stop_times:
+        max_stop = max(stop_times)
+        cutoff = max_stop - timedelta(days=30)
+        ran_30d = [p for p in parsed if p["stop_time"] and p["stop_time"] >= cutoff]
+        tasks_run_30d = len(ran_30d)
+        successful_30d = sum(1 for p in ran_30d if p["status"] == 7)
+        failed_30d = tasks_run_30d - successful_30d
+        pct_30d = round(100.0 * successful_30d / tasks_run_30d, 1) if tasks_run_30d else 0
+    else:
+        tasks_run_30d = successful_30d = failed_30d = 0
+        pct_30d = 0
+
+    pct_overall = round(100.0 * successful / with_results, 1) if with_results else 0
+
+    return {
+        "total_tasks": total, "tasks_with_results": with_results,
+        "tasks_run_30d": tasks_run_30d, "successful_30d": successful_30d,
+        "failed_30d": failed_30d, "success_pct_30d": pct_30d,
+        "successful_overall": successful,
+        "not_successful_overall": with_results - successful,
+        "success_pct_overall": pct_overall,
+        "never_succeeded_count": len(never_succeeded),
+        "never_succeeded_list": sorted(never_succeeded, key=lambda x: x.get("name") or "")[:25],
+    }
+
+def compute_reload_activity(data: Dict[str, Any]) -> Dict[str, int]:
+    """Compute reload activity anchored to max stopTime in data."""
+    from datetime import timedelta
+    reload_tasks = data.get("reload_tasks", [])
+    if not reload_tasks:
+        return {"apps_reloaded_30d": 0, "apps_reloaded_90d": 0}
+
+    # Get last stop time per app
+    app_last_stop: Dict[str, Any] = {}
+    for rt in reload_tasks:
+        app = rt.get("app") or {}
+        app_id = app.get("id")
+        if not app_id:
+            continue
+        op = rt.get("operational") or {}
+        last = op.get("lastExecutionResult") or {}
+        stop = _parse_ts(last.get("stopTime"))
+        if stop and (app_id not in app_last_stop or stop > app_last_stop[app_id]):
+            app_last_stop[app_id] = stop
+
+    if not app_last_stop:
+        return {"apps_reloaded_30d": 0, "apps_reloaded_90d": 0}
+
+    max_stop = max(app_last_stop.values())
+    cutoff_30 = max_stop - timedelta(days=30)
+    cutoff_90 = max_stop - timedelta(days=90)
+
+    return {
+        "apps_reloaded_30d": sum(1 for ts in app_last_stop.values() if ts >= cutoff_30),
+        "apps_reloaded_90d": sum(1 for ts in app_last_stop.values() if ts >= cutoff_90),
+    }
+
+def compute_license_usage(data: Dict[str, Any]) -> Dict[str, int]:
+    """Compute license usage anchored to max lastUsed in data."""
+    from datetime import timedelta
+
+    def _bucket(records: list, prefix: str) -> Dict[str, int]:
+        timestamps = []
+        for r in records:
+            lu = r.get("lastUsed") or r.get("lastAccess") or r.get("lastSeen")
+            ts = _parse_ts(lu) if lu and lu != "1753-01-01T00:00:00Z" else None
+            timestamps.append(ts)
+
+        valid_ts = [t for t in timestamps if t is not None]
+        anchor = max(valid_ts) if valid_ts else None
+
+        used_30d = not_used_30d = never_used = 0
+        for ts in timestamps:
+            if ts is None:
+                never_used += 1
+            elif anchor and ts >= anchor - timedelta(days=30):
+                used_30d += 1
+            else:
+                not_used_30d += 1
+
+        return {
+            f"{prefix}_used_30d": used_30d,
+            f"{prefix}_not_used_30d": not_used_30d,
+            f"{prefix}_never_used": never_used,
+        }
+
+    result = {}
+    prof = data.get("professional_access", [])
+    if isinstance(prof, list):
+        result.update(_bucket(prof, "professional"))
+
+    analyzer = data.get("analyzer_access", []) or data.get("analyzer_time_access", [])
+    if isinstance(analyzer, list):
+        result.update(_bucket(analyzer, "analyzer"))
+
+    return result
+
 # =========================
 # Report generation
 # =========================
@@ -484,6 +644,9 @@ def generate_sample_report(data_folder: Path, output_path: str, logo_path: Optio
     rule_stats = compute_rule_stats(data)
     servers = build_server_list(data)
     about = data.get("about", {})
+    tex = compute_task_execution_health(data)
+    rts = compute_reload_activity(data)
+    lic_usage = compute_license_usage(data)
 
     # Parse license
     key_details = lic.get("keyDetails", "")
@@ -532,14 +695,33 @@ def generate_sample_report(data_folder: Path, output_path: str, logo_path: Optio
         ("Extensions", len(extensions) if isinstance(extensions, list) else 0, "info"),
         ("Reload Tasks", len(reload_tasks) if isinstance(reload_tasks, list) else 0, "info"),
     ])
-
-    _h2(doc, "Reload Health")
     _kpi_cards(doc, [
-        ("Apps reloaded (30d)", "—", "ok"),
-        ("Apps reloaded (90d)", "—", "ok"),
-        ("Failed tasks (last run)", "—", "bad"),
-        ("Tasks > 3h (last run)", "—", "warn"),
+        ("Apps reloaded (30d)", rts.get("apps_reloaded_30d", 0), "ok"),
+        ("Apps reloaded (90d)", rts.get("apps_reloaded_90d", 0), "ok"),
     ])
+
+    _h2(doc, "Task Execution Health")
+    _kpi_cards(doc, [
+        ("Total Tasks", tex.get("total_tasks", 0), "info"),
+        ("Tasks w/ Results", tex.get("tasks_with_results", 0), "info"),
+        ("Tasks Run (30d)", tex.get("tasks_run_30d", 0), "info"),
+        ("Success Rate (30d)", f'{tex.get("success_pct_30d", 0)}%', "ok" if tex.get("success_pct_30d", 0) >= 80 else "warn"),
+    ])
+    _kpi_cards(doc, [
+        ("Successful (overall)", tex.get("successful_overall", 0), "ok"),
+        ("Not Successful", tex.get("not_successful_overall", 0), "bad" if tex.get("not_successful_overall", 0) > 0 else "info"),
+        ("Success Rate (overall)", f'{tex.get("success_pct_overall", 0)}%', "ok" if tex.get("success_pct_overall", 0) >= 80 else "warn"),
+        ("Never Succeeded", tex.get("never_succeeded_count", 0), "bad" if tex.get("never_succeeded_count", 0) > 0 else "ok"),
+    ])
+    never_succ = tex.get("never_succeeded_list", [])
+    if never_succ:
+        ns_rows = [
+            (t.get("name", "?"), STATUS_LABELS.get(t.get("status"), "NoExecution" if t.get("status") is None else f"Unknown({t.get('status')})"))
+            for t in never_succ
+        ]
+        _table_2col(doc, "Task Name", "Last Status", ns_rows)
+        if tex.get("never_succeeded_count", 0) > len(never_succ):
+            _para(doc, f"  ... and {tex['never_succeeded_count'] - len(never_succ)} more", size=9, color=QLIK_RGB["gray6"])
 
     # License — Meta
     _h2(doc, "License — Meta")
@@ -553,25 +735,26 @@ def generate_sample_report(data_folder: Path, output_path: str, logo_path: Optio
     _kpi_cards(doc, [
         ("Allotment (from key)", lic_parsed.get("allot_professional") or "—", "info"),
         ("Allocated", prof_allocated, "info"),
-        ("Used 30d", "—", "ok"),
-        ("Not used 30d", "—", "warn"),
+        ("Used 30d", lic_usage.get("professional_used_30d", 0), "ok"),
+        ("Not used 30d", lic_usage.get("professional_not_used_30d", 0), "warn"),
     ])
     _kpi_cards(doc, [
-        ("Never used", "—", "bad"),
+        ("Never used", lic_usage.get("professional_never_used", 0), "bad"),
         ("", "", "info"), ("", "", "info"), ("", "", "info"),
     ])
 
     # License — Analyzer
+    analyzer_allocated = len(data.get("analyzer_access", []) or data.get("analyzer_time_access", []) or [])
     _h2(doc, "License — Analyzer")
     _kpi_cards(doc, [
         ("Allotment (from key)", lic_parsed.get("allot_analyzer") or "—", "info"),
-        ("Allocated", "—", "info"),
+        ("Allocated", analyzer_allocated, "info"),
         ("Analyzer time (tokens)", "—", "info"),
-        ("Used 30d", "—", "ok"),
+        ("Used 30d", lic_usage.get("analyzer_used_30d", 0), "ok"),
     ])
     _kpi_cards(doc, [
-        ("Not used 30d", "—", "warn"),
-        ("Never used", "—", "bad"),
+        ("Not used 30d", lic_usage.get("analyzer_not_used_30d", 0), "warn"),
+        ("Never used", lic_usage.get("analyzer_never_used", 0), "bad"),
         ("", "", "info"), ("", "", "info"),
     ])
 

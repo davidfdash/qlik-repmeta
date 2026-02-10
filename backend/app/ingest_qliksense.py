@@ -64,6 +64,7 @@ FILES_MAP = [
     ("access_analyzer", "QlikAnalyzerAccessType.json", None),
     ("access_analyzer_time", "QlikAnalyzerTimeAccessType.json", None),
     ("reload_tasks", "QlikReloadTask.json", "appId"),
+    ("tasks", "QlikTask.json", None),
     ("servernode_config", "QlikServernodeConfiguration.json", None),
     ("system_rules", "QlikSystemRule.json", None),
     ("streams", "QlikStream.json", None),
@@ -245,8 +246,8 @@ async def ingest_from_buffers(buffers: Dict[str, bytes], customer_id: int, notes
                     data = _read_json_bytes(b)
 
                 key_name = "id"
-                if table in ("apps", "users", "extensions", "reload_tasks", "servernode_config", "system_rules", "app_objects", "streams", "access_professional", "access_analyzer", "access_analyzer_time"):
-                    key_name = {"apps":"app_id","users":"user_id","extensions":"extension_id","reload_tasks":"task_id","servernode_config":"node_id","system_rules":"rule_id","app_objects":"object_id","streams":"stream_id","access_professional":"access_id","access_analyzer":"access_id","access_analyzer_time":"access_id"}[table]
+                if table in ("apps", "users", "extensions", "reload_tasks", "tasks", "servernode_config", "system_rules", "app_objects", "streams", "access_professional", "access_analyzer", "access_analyzer_time"):
+                    key_name = {"apps":"app_id","users":"user_id","extensions":"extension_id","reload_tasks":"task_id","tasks":"task_id","servernode_config":"node_id","system_rules":"rule_id","app_objects":"object_id","streams":"stream_id","access_professional":"access_id","access_analyzer":"access_id","access_analyzer_time":"access_id"}[table]
                 if isinstance(data, list):
                     await _insert_collection(cur, table, key_name, data, snapshot_id, app_id_key=app_id_key)
                 elif isinstance(data, dict):
