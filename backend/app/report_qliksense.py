@@ -839,30 +839,6 @@ def _task_execution_health(cur, snapshot_id: int) -> Dict:
         _rollback_silent(cur)
         return defaults
 
-def _never_succeeded_tasks(cur, snapshot_id: int, limit: int = 25) -> List[Dict]:
-    """Fetch tasks whose last execution was not FinishedSuccess (status != 7)."""
-    try:
-        rows = cur.execute(
-            """
-            SELECT
-                COALESCE(data->>'name', data->>'taskName', '?') AS task_name,
-                (data->'operational'->'lastExecutionResult'->>'status')::int AS status
-            FROM repmeta_qs.tasks
-            WHERE snapshot_id=%s
-              AND (
-                (data->'operational'->'lastExecutionResult'->>'status')::int IS DISTINCT FROM 7
-                OR data->'operational'->'lastExecutionResult'->>'status' IS NULL
-              )
-            ORDER BY data->>'name'
-            LIMIT %s
-            """,
-            (snapshot_id, limit)
-        ).fetchall()
-        return [dict(r) for r in rows] if rows else []
-    except Exception:
-        _rollback_silent(cur)
-        return []
-
 # =========================
 # Main API
 # =========================
@@ -1018,7 +994,6 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
 
         # Task execution health (QlikTask.json)
         tex = _task_execution_health(cur, snapshot_id)
-        never_succ = _never_succeeded_tasks(cur, snapshot_id)
 
     # Executive blocks
     _h1(doc, "Executive Summary")
@@ -1055,15 +1030,6 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
         ("Success Rate (overall)", f'{tex.get("success_pct_overall", 0)}%', "ok" if tex.get("success_pct_overall", 0) >= 80 else "warn"),
         ("Never Succeeded", tex.get("never_succeeded_count", 0), "bad" if tex.get("never_succeeded_count", 0) > 0 else "ok"),
     ])
-    if never_succ:
-        ns_rows = [
-            (t.get("task_name", "?"), STATUS_LABELS.get(t.get("status"), "NoExecution" if t.get("status") is None else f"Unknown({t.get('status')})"))
-            for t in never_succ
-        ]
-        _table_2col(doc, "Task Name", "Last Status", ns_rows)
-        if tex.get("never_succeeded_count", 0) > len(never_succ):
-            _para(doc, f"  … and {tex['never_succeeded_count'] - len(never_succ)} more", size=9, color=QLIK_RGB["gray6"])
-
     # License
     _h2(doc, "License — Meta")
     _table_2col(doc, "Key", "Value", [

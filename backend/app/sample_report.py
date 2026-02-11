@@ -489,7 +489,7 @@ def compute_task_execution_health(data: Dict[str, Any]) -> Dict[str, Any]:
             "total_tasks": 0, "tasks_with_results": 0,
             "tasks_run_30d": 0, "successful_30d": 0, "failed_30d": 0, "success_pct_30d": 0,
             "successful_overall": 0, "not_successful_overall": 0, "success_pct_overall": 0,
-            "never_succeeded_count": 0, "never_succeeded_list": [],
+            "never_succeeded_count": 0,
         }
 
     total = len(tasks)
@@ -536,7 +536,6 @@ def compute_task_execution_health(data: Dict[str, Any]) -> Dict[str, Any]:
         "not_successful_overall": with_results - successful,
         "success_pct_overall": pct_overall,
         "never_succeeded_count": len(never_succeeded),
-        "never_succeeded_list": sorted(never_succeeded, key=lambda x: x.get("name") or "")[:25],
     }
 
 def compute_reload_activity(data: Dict[str, Any]) -> Dict[str, int]:
@@ -713,16 +712,6 @@ def generate_sample_report(data_folder: Path, output_path: str, logo_path: Optio
         ("Success Rate (overall)", f'{tex.get("success_pct_overall", 0)}%', "ok" if tex.get("success_pct_overall", 0) >= 80 else "warn"),
         ("Never Succeeded", tex.get("never_succeeded_count", 0), "bad" if tex.get("never_succeeded_count", 0) > 0 else "ok"),
     ])
-    never_succ = tex.get("never_succeeded_list", [])
-    if never_succ:
-        ns_rows = [
-            (t.get("name", "?"), STATUS_LABELS.get(t.get("status"), "NoExecution" if t.get("status") is None else f"Unknown({t.get('status')})"))
-            for t in never_succ
-        ]
-        _table_2col(doc, "Task Name", "Last Status", ns_rows)
-        if tex.get("never_succeeded_count", 0) > len(never_succ):
-            _para(doc, f"  ... and {tex['never_succeeded_count'] - len(never_succ)} more", size=9, color=QLIK_RGB["gray6"])
-
     # License — Meta
     _h2(doc, "License — Meta")
     _table_2col(doc, "Key", "Value", [
