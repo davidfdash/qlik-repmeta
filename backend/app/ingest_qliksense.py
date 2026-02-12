@@ -36,6 +36,19 @@ async def _insert_single(cur, table: str, snapshot_id: str, data: Dict[str, Any]
         (snapshot_id, json.dumps(data)),
     )
 
+def _extract_app_id(row: Dict[str, Any], app_id_key: str) -> Optional[str]:
+    """Extract app_id from a row, supporting dotted paths like 'app.id'."""
+    if '.' in app_id_key:
+        parts = app_id_key.split('.')
+        val = row
+        for p in parts:
+            if isinstance(val, dict):
+                val = val.get(p)
+            else:
+                return None
+        return val
+    return row.get(app_id_key)
+
 async def _insert_collection(cur, table: str, key_name: str, rows: List[Dict[str, Any]], snapshot_id: str, app_id_key: Optional[str] = None):
     if not rows:
         return
@@ -43,7 +56,7 @@ async def _insert_collection(cur, table: str, key_name: str, rows: List[Dict[str
         await cur.executemany(
             f"INSERT INTO repmeta_qs.{table} (snapshot_id, {key_name}, app_id, data) VALUES (%s, %s, %s, %s) "
             f"ON CONFLICT (snapshot_id, {key_name}) DO UPDATE SET data = EXCLUDED.data, app_id = EXCLUDED.app_id",
-            [(snapshot_id, str(r.get('id') or r.get(key_name) or _safe_id(r)), r.get(app_id_key), json.dumps(r)) for r in rows],
+            [(snapshot_id, str(r.get('id') or r.get(key_name) or _safe_id(r)), _extract_app_id(r, app_id_key), json.dumps(r)) for r in rows],
         )
     else:
         await cur.executemany(
@@ -63,7 +76,7 @@ FILES_MAP = [
     ("access_professional", "QlikProfessionalAccessType.json", None),
     ("access_analyzer", "QlikAnalyzerAccessType.json", None),
     ("access_analyzer_time", "QlikAnalyzerTimeAccessType.json", None),
-    ("reload_tasks", "QlikReloadTask.json", "appId"),
+    ("reload_tasks", "QlikReloadTask.json", "app.id"),
     ("tasks", "QlikTask.json", None),
     ("servernode_config", "QlikServernodeConfiguration.json", None),
     ("system_rules", "QlikSystemRule.json", None),
@@ -161,8 +174,9 @@ def _build_server_name_map(nodes: List[Dict[str, Any]], hardware: List[Dict[str,
 
     # Build mapping
     name_map = {}
+    pad = len(str(len(sorted_hosts)))
     for i, hostname in enumerate(sorted_hosts, 1):
-        name_map[hostname] = f"Server {i}"
+        name_map[hostname] = f"Server {str(i).zfill(pad)}"
 
     return name_map
 

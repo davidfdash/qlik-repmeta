@@ -1,0 +1,47 @@
+{
+  "family": "repmeta-backend",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::080763591642:role/service-role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "backend",
+      "image": "080763591642.dkr.ecr.us-east-1.amazonaws.com/repmeta/backend:latest",
+      "portMappings": [
+        {
+          "containerPort": 8002,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "DATABASE_URL",
+          "value": "postgresql://postgres:RepMeta2026!@database-wbtest-001.cluster-cd8oiyoii6hj.us-east-1.rds.amazonaws.com:5432/repmeta"
+        },
+        {
+          "name": "REPMETA_SCHEMA",
+          "value": "repmeta"
+        },
+        {
+          "name": "CORS_ORIGINS",
+          "value": "*"
+        },
+        {
+          "name": "AI_WORKER_EMBEDDED",
+          "value": "0"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/repmeta",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "backend"
+        }
+      },
+      "essential": true
+    }
+  ]
+}

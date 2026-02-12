@@ -16,8 +16,9 @@ type SenseSummary = {
   };
 };
 
-/** Keep API base identical to Replicate tab to avoid surprises */
-const API_BASE = "http://127.0.0.1:8002";
+/** API base: use env var, or same-origin in production, or localhost for dev */
+const API_BASE = import.meta.env.VITE_API_BASE_URL
+  || (window.location.hostname === "localhost" ? "http://127.0.0.1:8002" : "");
 
 /** ---- helpers (mirrored from Replicate lane) ---- */
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {

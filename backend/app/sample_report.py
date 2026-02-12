@@ -533,7 +533,7 @@ def compute_task_execution_health(data: Dict[str, Any]) -> Dict[str, Any]:
         "tasks_run_30d": tasks_run_30d, "successful_30d": successful_30d,
         "failed_30d": failed_30d, "success_pct_30d": pct_30d,
         "successful_overall": successful,
-        "not_successful_overall": with_results - successful,
+        "not_successful_overall": len(never_succeeded),
         "success_pct_overall": pct_overall,
         "never_succeeded_count": len(never_succeeded),
     }

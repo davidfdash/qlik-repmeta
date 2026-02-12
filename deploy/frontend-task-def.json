@@ -1,0 +1,29 @@
+{
+  "family": "repmeta-frontend",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::080763591642:role/service-role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "frontend",
+      "image": "080763591642.dkr.ecr.us-east-1.amazonaws.com/repmeta/frontend:latest",
+      "portMappings": [
+        {
+          "containerPort": 80,
+          "protocol": "tcp"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/repmeta",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "frontend"
+        }
+      },
+      "essential": true
+    }
+  ]
+}

@@ -229,7 +229,7 @@ SELECT
         ELSE 0
     END AS success_pct_30d,
     COUNT(*) FILTER (WHERE p.status = 7) AS successful_overall,
-    COUNT(*) FILTER (WHERE p.status IS NOT NULL AND p.status != 7) AS not_successful_overall,
+    COUNT(DISTINCT p.task_name) FILTER (WHERE p.status IS NOT NULL AND p.status != 7) AS not_successful_overall,
     CASE
         WHEN COUNT(*) FILTER (WHERE p.status IS NOT NULL) > 0
         THEN ROUND(100.0 * COUNT(*) FILTER (WHERE p.status = 7)

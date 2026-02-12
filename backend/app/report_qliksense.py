@@ -831,7 +831,7 @@ def _task_execution_health(cur, snapshot_id: int) -> Dict:
             "tasks_run_30d": tasks_run_30d, "successful_30d": successful_30d,
             "failed_30d": failed_30d, "success_pct_30d": pct_30d,
             "successful_overall": successful,
-            "not_successful_overall": with_results - successful,
+            "not_successful_overall": never_succeeded,
             "success_pct_overall": pct_overall,
             "never_succeeded_count": never_succeeded,
         }
@@ -1097,10 +1097,6 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
         ("Users", env.get("user_count")),
         ("Extensions", env.get("extension_count")),
     ])
-
-    _h1(doc, "Contents")
-    _hr(doc)
-    _add_toc(doc)
 
     doc.save(out_path)
     return out_path

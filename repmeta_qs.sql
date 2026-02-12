@@ -637,7 +637,7 @@ AS WITH app_ids AS (
            FROM repmeta_qs.v_apps a
         ), task_by_app AS (
          SELECT t.snapshot_id,
-            t.app_id,
+            COALESCE(t.app_id, t.data->'app'->>'id') AS app_id,
                 CASE
                     WHEN lower(t.data ->> 'enabled'::text) = 'true'::text THEN true
                     WHEN lower(t.data ->> 'enabled'::text) = 'false'::text THEN false
@@ -648,7 +648,7 @@ AS WITH app_ids AS (
  SELECT s.snapshot_id,
     ( SELECT count(*) AS count
            FROM app_ids a
-             LEFT JOIN task_by_app tb ON tb.snapshot_id = a.snapshot_id AND tb.app_id = a.app_id
+             LEFT JOIN task_by_app tb ON tb.snapshot_id = a.snapshot_id AND tb.app_id::text = a.app_id::text
           WHERE a.snapshot_id = s.snapshot_id AND tb.app_id IS NULL) AS apps_without_tasks,
     ( SELECT count(*) AS count
            FROM task_by_app tb
@@ -902,7 +902,7 @@ SELECT
         ELSE 0
     END AS success_pct_30d,
     COUNT(*) FILTER (WHERE p.status = 7) AS successful_overall,
-    COUNT(*) FILTER (WHERE p.status IS NOT NULL AND p.status != 7) AS not_successful_overall,
+    COUNT(DISTINCT p.task_name) FILTER (WHERE p.status IS NOT NULL AND p.status != 7) AS not_successful_overall,
     CASE
         WHEN COUNT(*) FILTER (WHERE p.status IS NOT NULL) > 0
         THEN ROUND(100.0 * COUNT(*) FILTER (WHERE p.status = 7)
