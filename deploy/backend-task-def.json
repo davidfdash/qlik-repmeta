@@ -2,8 +2,8 @@
   "family": "repmeta-backend",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
-  "cpu": "512",
-  "memory": "1024",
+  "cpu": "1024",
+  "memory": "3072",
   "executionRoleArn": "arn:aws:iam::080763591642:role/service-role/ecsTaskExecutionRole",
   "containerDefinitions": [
     {

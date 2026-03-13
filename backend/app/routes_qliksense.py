@@ -37,12 +37,17 @@ async def ingest(
         return {"snapshot_id": snapshot_id}
 
     buffers = {}
+    hardware_buffers = {}
     for f in (files or []):
-        base = os.path.basename(f.filename).lower()
-        if not base.endswith(".json") or not base.startswith("qlik"):
-            raise HTTPException(status_code=400, detail=f"Unexpected file: {f.filename}. Only Qlik*.json accepted.")
-        buffers[os.path.basename(f.filename)] = await f.read()
-    snapshot_id = await ingest_from_buffers(buffers, customer_id, notes)
+        base = os.path.basename(f.filename)
+        base_lower = base.lower()
+        if base_lower.endswith(".json") and base_lower.startswith("qlik"):
+            buffers[base] = await f.read()
+        elif base_lower.endswith(".json") and base_lower.startswith("osinfo_"):
+            hardware_buffers[base] = await f.read()
+        else:
+            raise HTTPException(status_code=400, detail=f"Unexpected file: {f.filename}. Only Qlik*.json or OSInfo_*.json accepted.")
+    snapshot_id = await ingest_from_buffers(buffers, customer_id, notes, hardware_buffers=hardware_buffers or None)
     return {"snapshot_id": snapshot_id}
 
 @router.get("/summary")

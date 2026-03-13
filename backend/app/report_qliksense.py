@@ -1026,7 +1026,7 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
     ])
     _kpi_cards(doc, [
         ("Successful (overall)", tex.get("successful_overall", 0), "ok"),
-        ("Not Successful", tex.get("not_successful_overall", 0), "bad" if tex.get("not_successful_overall", 0) > 0 else "info"),
+        ("Failed", tex.get("not_successful_overall", 0), "bad" if tex.get("not_successful_overall", 0) > 0 else "info"),
         ("Success Rate (overall)", f'{tex.get("success_pct_overall", 0)}%', "ok" if tex.get("success_pct_overall", 0) >= 80 else "warn"),
         ("Never Succeeded", tex.get("never_succeeded_count", 0), "bad" if tex.get("never_succeeded_count", 0) > 0 else "ok"),
     ])
@@ -1044,10 +1044,6 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
         ("Used 30d", lic30.get("professional_used_30d", 0), "ok"),
         ("Not used 30d", lic30.get("professional_not_used_30d", 0), "warn"),
     ])
-    _kpi_cards(doc, [
-        ("Never used", lic30.get("professional_never_used", 0), "bad"),
-        ("", "", "info"), ("", "", "info"), ("", "", "info"),
-    ])
 
     _h2(doc, "License — Analyzer")
     _kpi_cards(doc, [
@@ -1058,8 +1054,7 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
     ])
     _kpi_cards(doc, [
         ("Not used 30d", lic30.get("analyzer_not_used_30d", 0), "warn"),
-        ("Never used", lic30.get("analyzer_never_used", 0), "bad"),
-        ("", "", "info"), ("", "", "info"),
+        ("", "", "info"), ("", "", "info"), ("", "", "info"),
     ])
 
     _h2(doc, "Governance")
