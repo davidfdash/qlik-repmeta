@@ -28,6 +28,45 @@ async def _ensure_schema(cur):
     default = Path(__file__).parent / "sql" / "repmeta_qs_schema.sql"
     if default.exists():
         await cur.execute(default.read_text(encoding="utf-8"))
+    # Ensure tables added in schema v2 always exist (idempotent, safe to re-run)
+    await cur.execute("""
+        CREATE TABLE IF NOT EXISTS repmeta_qs.server_hardware (
+            snapshot_id int4 NOT NULL,
+            hostname text NOT NULL,
+            data jsonb NOT NULL,
+            CONSTRAINT server_hardware_pkey PRIMARY KEY (snapshot_id, hostname)
+        );
+        CREATE TABLE IF NOT EXISTS repmeta_qs.streams (
+            snapshot_id int4 NOT NULL,
+            stream_id text NOT NULL,
+            data jsonb NOT NULL,
+            CONSTRAINT streams_pkey PRIMARY KEY (snapshot_id, stream_id)
+        );
+        CREATE TABLE IF NOT EXISTS repmeta_qs.tasks (
+            snapshot_id int4 NOT NULL,
+            task_id text NOT NULL,
+            data jsonb NOT NULL,
+            CONSTRAINT tasks_pkey PRIMARY KEY (snapshot_id, task_id)
+        );
+        CREATE TABLE IF NOT EXISTS repmeta_qs.access_analyzer (
+            snapshot_id int4 NOT NULL,
+            access_id text NOT NULL,
+            data jsonb NOT NULL,
+            CONSTRAINT access_analyzer_pkey PRIMARY KEY (snapshot_id, access_id)
+        );
+        CREATE TABLE IF NOT EXISTS repmeta_qs.access_analyzer_time (
+            snapshot_id int4 NOT NULL,
+            access_id text NOT NULL,
+            data jsonb NOT NULL,
+            CONSTRAINT access_analyzer_time_pkey PRIMARY KEY (snapshot_id, access_id)
+        );
+        CREATE TABLE IF NOT EXISTS repmeta_qs.access_professional (
+            snapshot_id int4 NOT NULL,
+            access_id text NOT NULL,
+            data jsonb NOT NULL,
+            CONSTRAINT access_professional_pkey PRIMARY KEY (snapshot_id, access_id)
+        );
+    """)
 
 async def _insert_single(cur, table: str, snapshot_id: str, data: Dict[str, Any]):
     await cur.execute(
@@ -110,10 +149,18 @@ def _extract_hardware_info(hw_data: Dict[str, Any]) -> Dict[str, Any]:
     if win_os and len(win_os) > 0:
         os_caption = win_os[0].get("Caption")
 
+    def _safe_int(v):
+        try:
+            return int(v) if v and str(v).strip() else None
+        except (ValueError, TypeError):
+            return None
+
+    cpu = _safe_int(cpu_cores)
+    mem_bytes = _safe_int(total_memory_bytes)
     return {
         "hostname": hostname,
-        "cpu_cores": int(cpu_cores) if cpu_cores else None,
-        "total_memory_gb": round(int(total_memory_bytes) / (1024**3), 1) if total_memory_bytes else None,
+        "cpu_cores": cpu,
+        "total_memory_gb": round(mem_bytes / (1024**3), 1) if mem_bytes else None,
         "model": model,
         "os": os_caption,
     }
@@ -128,8 +175,9 @@ def _classify_hardware_files(files: Dict[str, bytes]) -> List[Dict[str, Any]]:
                 hw_info = _extract_hardware_info(hw_data)
                 hw_info["_raw"] = hw_data
                 hardware_list.append(hw_info)
-            except Exception:
-                pass
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning("Failed to parse hardware file %s: %s", filename, e)
     return hardware_list
 
 def _classify_files(files: Dict[str, bytes]) -> Dict[str, Optional[bytes]]:
