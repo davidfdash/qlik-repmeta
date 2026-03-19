@@ -36,7 +36,11 @@ async def _ensure_schema(cur):
             data jsonb NOT NULL,
             CONSTRAINT server_hardware_pkey PRIMARY KEY (snapshot_id, hostname)
         );
-        ALTER TABLE repmeta_qs.snapshots ADD COLUMN IF NOT EXISTS hostname_map jsonb;
+        CREATE TABLE IF NOT EXISTS repmeta_qs.snapshot_hostname_map (
+            snapshot_id int4 NOT NULL,
+            hostname_map jsonb NOT NULL,
+            CONSTRAINT snapshot_hostname_map_pkey PRIMARY KEY (snapshot_id)
+        );
         CREATE TABLE IF NOT EXISTS repmeta_qs.streams (
             snapshot_id int4 NOT NULL,
             stream_id text NOT NULL,
@@ -327,8 +331,9 @@ async def ingest_from_buffers(buffers: Dict[str, bytes], customer_id: int, notes
             # Store hostname map so hardware can be patched later without re-ingesting everything
             if server_name_map:
                 await cur.execute(
-                    "UPDATE repmeta_qs.snapshots SET hostname_map = %s WHERE snapshot_id = %s",
-                    (json.dumps(server_name_map), snapshot_id),
+                    "INSERT INTO repmeta_qs.snapshot_hostname_map (snapshot_id, hostname_map) VALUES (%s, %s) "
+                    "ON CONFLICT (snapshot_id) DO UPDATE SET hostname_map = EXCLUDED.hostname_map",
+                    (snapshot_id, json.dumps(server_name_map)),
                 )
 
             await conn.commit()
@@ -341,11 +346,11 @@ async def patch_hardware(snapshot_id: int, hardware_buffers: Dict[str, bytes]) -
         async with conn.cursor(row_factory=dict_row) as cur:
             await _ensure_schema(cur)
             row = await (await cur.execute(
-                "SELECT hostname_map FROM repmeta_qs.snapshots WHERE snapshot_id = %s",
+                "SELECT hostname_map FROM repmeta_qs.snapshot_hostname_map WHERE snapshot_id = %s",
                 (snapshot_id,),
             )).fetchone()
             if not row:
-                raise ValueError(f"Snapshot {snapshot_id} not found")
+                raise ValueError(f"No hostname map found for snapshot {snapshot_id}. Re-ingest to generate it.")
             hostname_map: Dict[str, str] = row["hostname_map"] or {}
 
             hardware_list = _classify_hardware_files(hardware_buffers)
