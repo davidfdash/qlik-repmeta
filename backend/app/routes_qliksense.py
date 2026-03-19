@@ -6,7 +6,7 @@ import os, tempfile
 import psycopg
 from psycopg.rows import dict_row
 
-from .ingest_qliksense import ingest_zip_bytes, ingest_from_buffers, _conninfo
+from .ingest_qliksense import ingest_zip_bytes, ingest_from_buffers, patch_hardware, _conninfo
 from .report_qliksense import generate_qs_report
 
 router = APIRouter(prefix="/qliksense", tags=["Qlik Sense"])
@@ -49,6 +49,21 @@ async def ingest(
             raise HTTPException(status_code=400, detail=f"Unexpected file: {f.filename}. Only Qlik*.json or OSInfo_*.json accepted.")
     snapshot_id = await ingest_from_buffers(buffers, customer_id, notes, hardware_buffers=hardware_buffers or None)
     return {"snapshot_id": snapshot_id}
+
+@router.post("/snapshots/{snapshot_id}/hardware")
+async def patch_hardware_route(snapshot_id: int, files: List[UploadFile]):
+    hardware_buffers = {}
+    for f in files:
+        base = os.path.basename(f.filename)
+        if base.lower().startswith("osinfo_") and base.lower().endswith(".json"):
+            hardware_buffers[base] = await f.read()
+        else:
+            raise HTTPException(status_code=400, detail=f"Unexpected file: {f.filename}. Only OSInfo_*.json accepted.")
+    if not hardware_buffers:
+        raise HTTPException(status_code=400, detail="No OSInfo_*.json files provided.")
+    count = await patch_hardware(snapshot_id, hardware_buffers)
+    return {"patched_servers": count}
+
 
 @router.get("/summary")
 async def summary(snapshot_id: str):

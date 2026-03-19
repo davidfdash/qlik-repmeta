@@ -151,6 +151,10 @@ const QlikSenseTab: React.FC = () => {
   // Upload refs
   const zipRef = useRef<HTMLInputElement | null>(null);
   const jsonsRef = useRef<HTMLInputElement | null>(null);
+  const hwRef = useRef<HTMLInputElement | null>(null);
+  const [hwPhase, setHwPhase] = useState<Phase>("idle");
+  const [hwPct, setHwPct] = useState<number | null>(null);
+  const [snapshots, setSnapshots] = useState<{snapshot_id: number; snapshot_ts: string; notes: string | null}[]>([]);
 
   // UI / flow
   const [busy, setBusy] = useState(false);
@@ -201,6 +205,13 @@ const QlikSenseTab: React.FC = () => {
     })();
   }, []);
 
+  useEffect(() => {
+    if (!customerId) { setSnapshots([]); return; }
+    fetchJson<{snapshot_id: number; snapshot_ts: string; notes: string | null}[]>(
+      `${API_BASE}/qliksense/snapshots?customer_id=${customerId}`
+    ).then(setSnapshots).catch(() => setSnapshots([]));
+  }, [customerId]);
+
   /** actions */
   async function handleAddCustomer() {
     const name = newCustomerName.trim();
@@ -232,6 +243,33 @@ const QlikSenseTab: React.FC = () => {
   function resetFiles() {
     if (zipRef.current) zipRef.current.value = "";
     if (jsonsRef.current) jsonsRef.current.value = "";
+  }
+
+  async function handlePatchHardware() {
+    if (!snapshotId) return toast("No active snapshot. Ingest first or select an existing one.", "err");
+    const files = hwRef.current?.files;
+    if (!files || files.length === 0) return toast("Choose one or more OSInfo_*.json files.", "err");
+    try {
+      setBusy(true);
+      setHwPhase("uploading");
+      const fd = new FormData();
+      Array.from(files).forEach((f) => fd.append("files", f as Blob));
+      const j = await xhrPost(
+        `${API_BASE}/qliksense/snapshots/${snapshotId}/hardware`,
+        fd,
+        setHwPct,
+        setHwPhase
+      );
+      toast(`Hardware patched: ${j?.patched_servers ?? 0} server(s) updated.`, "ok");
+      setHwPhase("done");
+    } catch (e: any) {
+      setHwPhase("error");
+      toast(`Hardware patch failed: ${e.message}`, "err");
+    } finally {
+      setBusy(false);
+      if (hwRef.current) hwRef.current.value = "";
+      setHwPct(null);
+    }
   }
 
   async function handleIngest() {
@@ -594,6 +632,24 @@ const QlikSenseTab: React.FC = () => {
                 </select>
               </div>
             </div>
+
+            {snapshots.length > 0 && (
+              <div className="mt-4 space-y-1">
+                <label className="block text-sm font-semibold text-gray-700">Load Existing Snapshot</label>
+                <select
+                  className="w-full rounded border border-gray-300 bg-white px-3 h-10 text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-green-500"
+                  value={snapshotId ?? ""}
+                  onChange={(e) => setSnapshotId(e.target.value || null)}
+                >
+                  <option value="">Select a snapshot…</option>
+                  {snapshots.map((s: {snapshot_id: number; snapshot_ts: string; notes: string | null}) => (
+                    <option key={s.snapshot_id} value={s.snapshot_id}>
+                      #{s.snapshot_id} — {new Date(s.snapshot_ts).toLocaleDateString()}{s.notes ? ` (${s.notes})` : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
 
           {/* Upload Section */}
@@ -641,6 +697,17 @@ const QlikSenseTab: React.FC = () => {
                 onUpload={handleIngest}
                 phase={ingestPhase}
                 pct={ingestPct}
+              />
+
+              <UploadCard
+                title="Patch Hardware Data"
+                icon="🖥️"
+                description={snapshotId ? `Upload OSInfo_*.json files to add CPU/RAM to snapshot #${snapshotId}.` : "Select a snapshot first, then upload OSInfo_*.json files."}
+                fileControl={hwRef}
+                accept=".json"
+                onUpload={handlePatchHardware}
+                phase={hwPhase}
+                pct={hwPct}
               />
             </div>
           </div>
