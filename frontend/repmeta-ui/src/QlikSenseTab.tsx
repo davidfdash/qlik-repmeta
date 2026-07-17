@@ -239,7 +239,7 @@ const QlikSenseTab: React.FC = () => {
     const zip = zipRef.current?.files?.[0] ?? null;
     const jsons = jsonsRef.current?.files ?? null;
     if (!zip && !(jsons && jsons.length > 0)) {
-      return toast("Choose a ZIP or one or more Qlik*.json files.", "err");
+      return toast("Choose a ZIP or the exported Qlik Sense folder.", "err");
     }
 
     try {
@@ -253,7 +253,11 @@ const QlikSenseTab: React.FC = () => {
       if (zip) {
         fd.append("file", zip); // backend expects "file" for ZIP
       } else if (jsons && jsons.length > 0) {
-        Array.from(jsons).forEach((f) => fd.append("files", f)); // backend expects "files" for multiple JSONs
+        // Folder selection can include stray OS files (desktop.ini, .DS_Store, etc.)
+        // alongside nested Hardware/OSInfo_*.json — only forward files the backend recognizes.
+        Array.from(jsons)
+          .filter((f) => /^qlik.*\.json$/i.test(f.name) || /^osinfo_.*\.json$/i.test(f.name))
+          .forEach((f) => fd.append("files", f)); // backend expects "files" for multiple JSONs
       }
 
       // Upload + ingest (progress UI identical to Replicate)
@@ -322,6 +326,7 @@ const QlikSenseTab: React.FC = () => {
     onUpload,
     phase,
     pct,
+    directory,
   }: {
     title: string;
     icon: string;
@@ -331,6 +336,7 @@ const QlikSenseTab: React.FC = () => {
     onUpload: () => void;
     phase: Phase;
     pct: number | null;
+    directory?: boolean;
   }) {
     const [fileName, setFileName] = useState("");
     const [isDragging, setIsDragging] = useState(false);
@@ -372,13 +378,14 @@ const QlikSenseTab: React.FC = () => {
             accept={accept}
             onChange={(e) => setFileName(e.target.files?.[0]?.name || (e.target.files && e.target.files.length > 1 ? `${e.target.files.length} files` : ""))}
             multiple={accept.includes(".json")} // enable multiple for jsons control
+            {...(directory ? ({ webkitdirectory: "", directory: "" } as any) : {})}
           />
 
           <button
             onClick={() => fileControl.current?.click()}
             className="w-full rounded border border-gray-300 bg-white hover:bg-gray-50 px-4 h-10 text-sm text-gray-700 font-medium transition-colors"
           >
-            {fileName ? `✓ ${fileName}` : "Choose File(s)"}
+            {fileName ? `✓ ${fileName}` : directory ? "Choose Folder" : "Choose File(s)"}
           </button>
 
           <button
@@ -633,14 +640,15 @@ const QlikSenseTab: React.FC = () => {
               />
 
               <UploadCard
-                title="Or Upload JSONs"
+                title="Or Upload Folder"
                 icon="📄"
-                description="Select one or more Qlik*.json files."
+                description="Select the exported Qlik Sense folder — Qlik*.json and the Hardware/OSInfo_*.json files are picked up automatically."
                 fileControl={jsonsRef}
                 accept=".json"
                 onUpload={handleIngest}
                 phase={ingestPhase}
                 pct={ingestPct}
+                directory
               />
             </div>
           </div>
