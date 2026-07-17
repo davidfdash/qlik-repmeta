@@ -337,7 +337,10 @@ async def ingest_zip_bytes(zip_bytes: bytes, customer_id: int, notes: Optional[s
     buffers: Dict[str, bytes] = {}
     hardware_buffers: Dict[str, bytes] = {}
     for name in zf.namelist():
-        base = name.split("/")[-1]
+        # Some zip tools store entries with "\" separators instead of the
+        # zip-spec "/"; Python's zipfile only normalizes this on Windows, so
+        # do it explicitly here to behave the same regardless of host OS.
+        base = name.replace("\\", "/").split("/")[-1]
         # Qlik metadata files
         if base.lower().endswith(".json") and base.lower().startswith("qlik"):
             buffers[base] = zf.read(name)
