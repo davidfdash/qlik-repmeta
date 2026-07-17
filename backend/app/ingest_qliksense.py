@@ -36,11 +36,6 @@ async def _ensure_schema(cur):
             data jsonb NOT NULL,
             CONSTRAINT server_hardware_pkey PRIMARY KEY (snapshot_id, hostname)
         );
-        CREATE TABLE IF NOT EXISTS repmeta_qs.snapshot_hostname_map (
-            snapshot_id int4 NOT NULL,
-            hostname_map jsonb NOT NULL,
-            CONSTRAINT snapshot_hostname_map_pkey PRIMARY KEY (snapshot_id)
-        );
         CREATE TABLE IF NOT EXISTS repmeta_qs.streams (
             snapshot_id int4 NOT NULL,
             stream_id text NOT NULL,
@@ -70,6 +65,11 @@ async def _ensure_schema(cur):
             access_id text NOT NULL,
             data jsonb NOT NULL,
             CONSTRAINT access_professional_pkey PRIMARY KEY (snapshot_id, access_id)
+        );
+        CREATE TABLE IF NOT EXISTS repmeta_qs.access_type_info (
+            snapshot_id int4 NOT NULL,
+            data jsonb NOT NULL,
+            CONSTRAINT access_type_info_pkey PRIMARY KEY (snapshot_id)
         );
     """)
 
@@ -113,6 +113,7 @@ FILES_MAP = [
     ("about", "QlikAbout.json", None),
     ("system_info", "QlikSystemInfo.json", None),
     ("license", "QlikLicense.json", None),
+    ("access_type_info", "QlikAccesstypeinfo.json", None),
     ("apps", "QlikApp.json", None),
     ("app_objects", "QlikAppObject.json", "appId"),
     ("users", "QlikUser.json", None),
@@ -276,7 +277,7 @@ async def ingest_from_buffers(buffers: Dict[str, bytes], customer_id: int, notes
             filemap = _classify_files(buffers)
 
             # Singletons
-            for table, canon, _ in FILES_MAP[:3]:
+            for table, canon, _ in FILES_MAP[:4]:
                 data = filemap.get(canon)
                 if data:
                     await _insert_single(cur, table, snapshot_id, _read_json_bytes(data))
@@ -301,7 +302,7 @@ async def ingest_from_buffers(buffers: Dict[str, bytes], customer_id: int, notes
             obfuscated_hardware = _obfuscate_hardware_info(hardware_list, server_name_map)
 
             # Collections
-            for table, canon, app_id_key in FILES_MAP[3:]:
+            for table, canon, app_id_key in FILES_MAP[4:]:
                 b = filemap.get(canon)
                 if not b:
                     continue
@@ -328,42 +329,8 @@ async def ingest_from_buffers(buffers: Dict[str, bytes], customer_id: int, notes
                     [(snapshot_id, h["hostname"], json.dumps(h)) for h in obfuscated_hardware],
                 )
 
-            # Store hostname map so hardware can be patched later without re-ingesting everything
-            if server_name_map:
-                await cur.execute(
-                    "INSERT INTO repmeta_qs.snapshot_hostname_map (snapshot_id, hostname_map) VALUES (%s, %s) "
-                    "ON CONFLICT (snapshot_id) DO UPDATE SET hostname_map = EXCLUDED.hostname_map",
-                    (snapshot_id, json.dumps(server_name_map)),
-                )
-
             await conn.commit()
             return str(snapshot_id)
-
-async def patch_hardware(snapshot_id: int, hardware_buffers: Dict[str, bytes]) -> int:
-    """Upsert hardware data for an existing snapshot using its stored hostname_map."""
-    async with await psycopg.AsyncConnection.connect(_conninfo()) as conn:
-        await conn.set_autocommit(False)
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await _ensure_schema(cur)
-            row = await (await cur.execute(
-                "SELECT hostname_map FROM repmeta_qs.snapshot_hostname_map WHERE snapshot_id = %s",
-                (snapshot_id,),
-            )).fetchone()
-            if not row:
-                raise ValueError(f"No hostname map found for snapshot {snapshot_id}. Re-ingest to generate it.")
-            hostname_map: Dict[str, str] = row["hostname_map"] or {}
-
-            hardware_list = _classify_hardware_files(hardware_buffers)
-            obfuscated = _obfuscate_hardware_info(hardware_list, hostname_map)
-            if obfuscated:
-                await cur.executemany(
-                    "INSERT INTO repmeta_qs.server_hardware (snapshot_id, hostname, data) VALUES (%s, %s, %s) "
-                    "ON CONFLICT (snapshot_id, hostname) DO UPDATE SET data = EXCLUDED.data",
-                    [(snapshot_id, h["hostname"], json.dumps(h)) for h in obfuscated],
-                )
-            await conn.commit()
-            return len(obfuscated)
-
 
 async def ingest_zip_bytes(zip_bytes: bytes, customer_id: int, notes: Optional[str]) -> str:
     zf = zipfile.ZipFile(io.BytesIO(zip_bytes))

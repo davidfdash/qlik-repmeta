@@ -6,7 +6,7 @@ import os
 import re
 import tempfile
 from datetime import datetime
-from typing import Iterable, Optional, Sequence, Tuple, List, Dict
+from typing import Any, Iterable, Optional, Sequence, Tuple, List, Dict
 
 import psycopg
 from psycopg.rows import dict_row
@@ -415,6 +415,35 @@ def _license_allocations_counts(cur, snapshot_id: int) -> Dict[str, int]:
     try:
         row = cur.execute("SELECT COUNT(*) AS c FROM repmeta_qs.access_analyzer WHERE snapshot_id=%s", (snapshot_id,)).fetchone()
         out["analyzer_allocations"] = row.get("c", 0) if row else 0
+    except Exception:
+        _rollback_silent(cur)
+    return out
+
+def _fetch_access_type_info(cur, snapshot_id: int) -> Dict[str, Any]:
+    """Token-based license allotment/usage from QlikAccesstypeinfo.json (AccessTypesInfo)."""
+    empty_type = {"allocatedTokens": None, "usedTokens": None, "quarantinedTokens": None, "tokenCost": None}
+    out: Dict[str, Any] = {
+        "totalTokens": None,
+        "availableTokens": None,
+        "professionalAccessType": dict(empty_type),
+        "analyzerAccessType": dict(empty_type),
+    }
+    try:
+        row = cur.execute(
+            "SELECT data FROM repmeta_qs.access_type_info WHERE snapshot_id=%s", (snapshot_id,)
+        ).fetchone()
+        data = row.get("data") if row else None
+        if data:
+            out["totalTokens"] = data.get("totalTokens")
+            out["availableTokens"] = data.get("availableTokens")
+            for key in ("professionalAccessType", "analyzerAccessType"):
+                sub = data.get(key) or {}
+                out[key] = {
+                    "allocatedTokens": sub.get("allocatedTokens"),
+                    "usedTokens": sub.get("usedTokens"),
+                    "quarantinedTokens": sub.get("quarantinedTokens"),
+                    "tokenCost": sub.get("tokenCost"),
+                }
     except Exception:
         _rollback_silent(cur)
     return out
@@ -982,6 +1011,9 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
         keyd = _parse_license_key_details(lic_raw.get("key_details"))
         serial = lic.get("license_number") or lic_raw.get("serial")
         alloc = _license_allocations_counts(cur, snapshot_id)
+        atinfo = _fetch_access_type_info(cur, snapshot_id)
+        prof_tokens = atinfo["professionalAccessType"]
+        anlz_tokens = atinfo["analyzerAccessType"]
 
         # Robust rules breakdown
         rule_breakdown = _security_rules_breakdown(cur, snapshot_id)
@@ -1031,30 +1063,43 @@ def generate_qs_report(snapshot_id: int, out_path: str, logo_path: Optional[str]
         ("Never Succeeded", tex.get("never_succeeded_count", 0), "bad" if tex.get("never_succeeded_count", 0) > 0 else "ok"),
     ])
     # License
+    def _v(x):
+        return x if x is not None else "—"
+
     _h2(doc, "License — Meta")
     _table_2col(doc, "Key", "Value", [
         ("Valid to", getattr(_parse_license_key_details, "valid_to", None) or lic.get("expiration") or "—"),
         ("License #", serial or "—"),
+        ("Total Tokens", _v(atinfo.get("totalTokens"))),
+        ("Available Tokens", _v(atinfo.get("availableTokens"))),
     ])
 
     _h2(doc, "License — Professional")
     _kpi_cards(doc, [
-        ("Allotment (from key)", keyd.get("allot_professional") or "—", "info"),
-        ("Allocated", alloc.get("professional_allocations", lic.get("professional_allocations", 0)), "info"),
+        ("Token Allotment", _v(prof_tokens.get("allocatedTokens")) if prof_tokens.get("allocatedTokens") is not None else (keyd.get("allot_professional") or "—"), "info"),
+        ("Tokens Used", _v(prof_tokens.get("usedTokens")), "info"),
+        ("Tokens Quarantined", _v(prof_tokens.get("quarantinedTokens")), "info"),
+        ("Token Cost", _v(prof_tokens.get("tokenCost")), "info"),
+    ])
+    _kpi_cards(doc, [
+        ("Named Allocations", alloc.get("professional_allocations", lic.get("professional_allocations", 0)), "info"),
         ("Used 30d", lic30.get("professional_used_30d", 0), "ok"),
         ("Not used 30d", lic30.get("professional_not_used_30d", 0), "warn"),
+        ("", "", "info"),
     ])
 
     _h2(doc, "License — Analyzer")
     _kpi_cards(doc, [
-        ("Allotment (from key)", keyd.get("allot_analyzer") or "—", "info"),
-        ("Allocated", alloc.get("analyzer_allocations", lic.get("analyzer_allocations", 0)), "info"),
-        ("Analyzer time (tokens)", keyd.get("analyzer_time") or "—", "info"),
-        ("Used 30d", lic30.get("analyzer_used_30d", 0), "ok"),
+        ("Token Allotment", _v(anlz_tokens.get("allocatedTokens")) if anlz_tokens.get("allocatedTokens") is not None else (keyd.get("allot_analyzer") or "—"), "info"),
+        ("Tokens Used", _v(anlz_tokens.get("usedTokens")), "info"),
+        ("Tokens Quarantined", _v(anlz_tokens.get("quarantinedTokens")), "info"),
+        ("Token Cost", _v(anlz_tokens.get("tokenCost")), "info"),
     ])
     _kpi_cards(doc, [
+        ("Named Allocations", alloc.get("analyzer_allocations", lic.get("analyzer_allocations", 0)), "info"),
+        ("Analyzer time (tokens)", keyd.get("analyzer_time") or "—", "info"),
+        ("Used 30d", lic30.get("analyzer_used_30d", 0), "ok"),
         ("Not used 30d", lic30.get("analyzer_not_used_30d", 0), "warn"),
-        ("", "", "info"), ("", "", "info"), ("", "", "info"),
     ])
 
     _h2(doc, "Governance")
